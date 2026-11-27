@@ -294,7 +294,6 @@ function formsOf(rgba: Uint8Array): Form[] {
   const forms: Form[] = [];
   if (colours !== null) {
     forms.push(paletteForm(rgba, colours, 'count'));
-    forms.push(paletteForm(rgba, colours, 'luminance'));
     if (!grey) return forms;
   }
   const key = opaque ? null : transparentKey(rgba, grey);
@@ -310,7 +309,7 @@ function formsOf(rgba: Uint8Array): Form[] {
   const bpp = ({ 0: 1, 2: 3, 4: 2, 6: 4 })[ct as 0 | 2 | 4 | 6];
   forms.push({
     colourType: ct, bpp, samples: samplesOf(rgba, ct), plte: null, trns,
-    filters: [0, 1, 2, 3, 4, 'minsum', 'pairs', 'brute'],
+    filters: (ct === 0 || ct === 2 || ct === 6) ? [0, 1, 2, 3, 4, 'pairs', 'brute'] : [0, 1, 2, 3, 4, 'pairs'],
   });
   return forms;
 }
@@ -558,15 +557,20 @@ function canonicalCodes(len) {
 // max distance (always valid: both distances achieve the merged range).
 const HASH_BITS = 15;
 const HASH_MASK = (1 << HASH_BITS) - 1;
-const CHAIN_CAP = 128;
-const GOOD_LEN = 32;
-const NICE_LEN = 128;
-const MAXSEG = 8;
+export let CHAIN_CAP = 128;
+export let GOOD_LEN = 32;
+export let NICE_LEN = 128;
+export let MAXSEG = 8;
 
+let matcherDv = null;
 class Matcher {
   constructor(n) {
     this.head = new Int32Array(1 << HASH_BITS).fill(-1);
     this.prev = new Int32Array(n).fill(-1);
+    this.head2 = new Int32Array(1 << HASH_BITS).fill(-1);
+    this.prev2 = new Int32Array(n).fill(-1);
+    this.hashval2 = new Int32Array(n);
+    this.same = null;
     // cache
     this.cacheLen = new Uint16Array(n);
     this.cacheSegCount = new Uint8Array(n);
@@ -639,8 +643,22 @@ class Matcher {
     }
     return out;
   }
+  ensureSame(data) {
+    if (this.same !== null) return;
+    const n = data.length;
+    const same = new Uint16Array(n + 1);
+    for (let i = n - 1; i >= 0; i--) {
+      if (i + 1 < n && data[i] === data[i + 1]) {
+        const v = same[i + 1] + 1;
+        same[i] = v > 258 ? 258 : v;
+      } else same[i] = 0;
+    }
+    this.same = same;
+  }
   // Finds the longest match at pos and caches its sublen segments.
   find(data, pos) {
+    this.ensureSame(data);
+    if (matcherDv === null || matcherDv.buffer !== data.buffer) matcherDv = new DataView(data.buffer, data.byteOffset, data.byteLength);
     const n = data.length;
     if (pos + 3 > n) { this.insert(data, pos); this.cacheLen[pos] = 0; this.cacheSegCount[pos] = 0; return 0; }
     const maxLen = Math.min(258, n - pos);
@@ -653,23 +671,42 @@ class Matcher {
     let curEnd = this.segEndA, curDist = this.segDistA;
     let nxtEnd = this.segEndB, nxtDist = this.segDistB;
     const base = pos * MAXSEG;
+    const same = this.same;
+    const same0 = same[pos];
+    const hv = ((data[pos] << 10) ^ (data[pos + 1] << 5) ^ data[pos + 2]) & HASH_MASK;
+    const val2 = ((same0 - 3) & 255) ^ hv;
+    let hprev = this.prev;
+    let switched = false;
     while (cur >= limit && cur >= 0 && chain-- > 0) {
       const dist = pos - cur;
       if (data[cur + bestLen] === data[pos + bestLen]) {
         let len = 0;
-        while (len < maxLen && data[cur + len] === data[pos + len]) len++;
-        if (len >= 3) {
-          segs = this.addCandidate(curEnd, curDist, segs, len, dist, nxtEnd, nxtDist);
-          const tE = curEnd; curEnd = nxtEnd; nxtEnd = tE;
-          const tD = curDist; curDist = nxtDist; nxtDist = tD;
-          if (len > bestLen) {
-            bestLen = len;
-            if (len >= NICE_LEN) break;
-            if (len >= GOOD_LEN) chain = Math.min(chain, CHAIN_CAP >> 2);
+        if (same0 > 2) {
+          const s1 = same[cur];
+          if (s1 > 2) {
+            len = same0 < s1 ? same0 : s1;
+            if (len > maxLen) len = maxLen;
           }
         }
+        const dv = matcherDv;
+        while (len + 4 <= maxLen && dv.getUint32(cur + len, true) === dv.getUint32(pos + len, true)) len += 4;
+        while (len < maxLen && data[cur + len] === data[pos + len]) len++;
+        if (len > bestLen) {
+          if (len >= 3) {
+            segs = this.addCandidate(curEnd, curDist, segs, len, dist, nxtEnd, nxtDist);
+            const tE = curEnd; curEnd = nxtEnd; nxtEnd = tE;
+            const tD = curDist; curDist = nxtDist; nxtDist = tD;
+          }
+          bestLen = len;
+          if (len >= NICE_LEN) break;
+          if (len >= GOOD_LEN) chain = Math.min(chain, CHAIN_CAP >> 2);
+        }
       }
-      cur = this.prev[cur];
+      if (!switched && bestLen >= same0 && this.hashval2[cur] === val2) {
+        switched = true;
+        hprev = this.prev2;
+      }
+      cur = hprev[cur];
     }
     for (let k = 0; k < segs; k++) { this.cacheSegEnd[base + k] = curEnd[k]; this.cacheSegDist[base + k] = curDist[k]; }
     this.cacheLen[pos] = bestLen;
@@ -683,15 +720,30 @@ class Matcher {
     const h = ((data[pos] << 10) ^ (data[pos + 1] << 5) ^ data[pos + 2]) & HASH_MASK;
     this.prev[pos] = this.head[h];
     this.head[h] = pos;
+    const same = this.same;
+    const v2 = (((same !== null ? same[pos] : 0) - 3) & 255) ^ h;
+    this.hashval2[pos] = v2;
+    this.prev2[pos] = this.head2[v2];
+    this.head2[v2] = pos;
   }
 }
 
 
+// DP scratch reused across calls (avoids ~60MB allocs per block).
+let dpCosts = new Float64Array(0);
+let dpPrevLen = new Int32Array(0);
+let dpPrevDist = new Int32Array(0);
 function lz77Optimal(data, start, end, litCost, distCost, matcher, populate) {
   const m = end - start;
-  const costs = new Float64Array(m + 1).fill(Infinity);
-  const prevLen = new Int32Array(m + 1);
-  const prevDist = new Int32Array(m + 1);
+  if (dpCosts.length < m + 1) {
+    dpCosts = new Float64Array(m + 1);
+    dpPrevLen = new Int32Array(m + 1);
+    dpPrevDist = new Int32Array(m + 1);
+  }
+  const costs = dpCosts.subarray(0, m + 1);
+  const prevLen = dpPrevLen.subarray(0, m + 1);
+  const prevDist = dpPrevDist.subarray(0, m + 1);
+  costs.fill(Infinity);
   costs[0] = 0;
   // Cost of emitting a match whose length falls in length-symbol ls.
   const matchLenCost = new Float64Array(29);
@@ -906,7 +958,72 @@ function adler32(data) {
  * opts: { refine = 1 } — extra DP passes per block after splitting (0 = parse once per block).
  */
 
-function optimalDeflate(data: Uint8Array, opts: { refine?: number } = {}): { stream: Uint8Array } {
+function blockSizeBits(syms, litLen, distLen) {
+  let hlit = 286;
+  while (hlit > 257 && litLen[hlit - 1] === 0) hlit--;
+  let hdist = 30;
+  while (hdist > 1 && distLen[hdist - 1] === 0) hdist--;
+  const all = new Uint8Array(hlit + hdist);
+  all.set(litLen.subarray(0, hlit), 0);
+  all.set(distLen.subarray(0, hdist), hlit);
+  const clSyms = [];
+  let i = 0;
+  while (i < all.length) {
+    if (all[i] === 0) {
+      let run = 0;
+      while (i + run < all.length && all[i + run] === 0 && run < 138) run++;
+      if (run >= 11) { const use = Math.min(run, 138); clSyms.push([18, use - 11, 7]); i += use; }
+      else if (run >= 3) { const use = Math.min(run, 10); clSyms.push([17, use - 3, 3]); i += use; }
+      else { for (let k = 0; k < run; k++) clSyms.push([0, 0, 0]); i += run; }
+    } else {
+      const v = all[i];
+      clSyms.push([v, 0, 0]);
+      i++;
+      let run = 0;
+      while (i + run < all.length && all[i + run] === v && run < 6) run++;
+      if (run >= 3) { clSyms.push([16, run - 3, 2]); i += run; }
+    }
+  }
+  const clFreq = new Uint32Array(19);
+  for (const s of clSyms) clFreq[s[0]]++;
+  const clLen = huffmanLengths(clFreq, 7);
+  const ORDER = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+  let hclen = 19;
+  while (hclen > 4 && clLen[ORDER[hclen - 1]] === 0) hclen--;
+  let bits = 3 + 5 + 5 + 4 + hclen * 3;
+  for (const s of clSyms) bits += clLen[s[0]] + s[2];
+  for (const s of syms) {
+    if (typeof s === 'number') bits += litLen[s];
+    else {
+      const ls = lengthSymbol(s.len);
+      bits += litLen[257 + ls] + LEN_EXTRA[ls];
+      const ds = distSymbol(s.dist);
+      bits += distLen[ds] + DIST_EXTRA[ds];
+    }
+  }
+  bits += litLen[256];
+  return bits;
+}
+// Deterministic PRNG (mulberry32) for the cost-model perturbation.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0; a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function perturbFreqs(litFreq, distFreq, rng) {
+  const nL = litFreq.length, nD = distFreq.length;
+  const nl = new Uint32Array(litFreq), nd = new Uint32Array(distFreq);
+  for (let i = 0; i < nL; i++) if (rng() < 1 / 3) nl[i] = litFreq[(rng() * nL) | 0];
+  for (let i = 0; i < nD; i++) if (rng() < 1 / 3) nd[i] = distFreq[(rng() * nD) | 0];
+  nl[256] = 1;
+  return { litFreq: nl, distFreq: nd };
+}
+
+function optimalDeflate(data: Uint8Array, opts: { refine?: number; noSplit?: boolean; resplit?: boolean; greedySeed?: boolean; maxIter?: number } = {}): { stream: Uint8Array } {
   const refine = opts.refine ?? 3;
   const n = data.length;
   const matcher = new Matcher(n);
@@ -917,25 +1034,54 @@ function optimalDeflate(data: Uint8Array, opts: { refine?: number } = {}): { str
   // Pass 0: whole image, fixed costs, populates the match cache.
   const pass0 = lz77Optimal(data, 0, n, fixedCosts.litCost, fixedCosts.distCost, matcher, true);
   // Cost-based block splitting on the pass-0 symbol sequence.
-  const ranges = splitRanges(pass0.syms);
+  const ranges = opts.noSplit ? [[0, pass0.syms.length]] : splitRanges(pass0.syms);
   // Per range: DP with the range's own Huffman costs (from pass-0 syms), then refine passes.
-  const blocks = [];
-  for (const [a, b] of ranges) {
-    const start = pass0.symPos[a];
-    const end = b < pass0.syms.length ? pass0.symPos[b] : n;
-    const { litFreq, distFreq } = freqsOf(pass0.syms.slice(a, b));
-    let { litCost, distCost } = costsFromLengths(huffmanLengths(litFreq, 15), huffmanLengths(distFreq, 15));
-    let res = null;
-    for (let it = 0; it <= refine; it++) {
-      res = lz77Optimal(data, start, end, litCost, distCost, matcher, false);
-      const f = freqsOf(res.syms);
-      const ll = huffmanLengths(f.litFreq, 15);
-      const dl = huffmanLengths(f.distFreq, 15);
-      const c = costsFromLengths(ll, dl);
-      litCost = c.litCost; distCost = c.distCost;
-      res.litLen = ll; res.distLen = dl;
+  function parseRanges(ranges, symSource) {
+    const maxIter = opts.maxIter ?? (refine + 1);
+    const blocks = [];
+    for (const [a, b] of ranges) {
+      const start = symSource.symPos[a];
+      const end = b < symSource.syms.length ? symSource.symPos[b] : n;
+      const { litFreq, distFreq } = freqsOf(symSource.syms.slice(a, b));
+      let { litCost, distCost } = costsFromLengths(huffmanLengths(litFreq, 15), huffmanLengths(distFreq, 15));
+      let best = null;
+      let lastSize = Infinity;
+      let stall = 0;
+      const rng = mulberry32(0xC0FFEE + start);
+      for (let it = 0; it < maxIter; it++) {
+        const res = lz77Optimal(data, start, end, litCost, distCost, matcher, false);
+        const f = freqsOf(res.syms);
+        const ll = huffmanLengths(f.litFreq, 15);
+        const dl = huffmanLengths(f.distFreq, 15);
+        const size = blockSizeBits(res.syms, ll, dl);
+        if (best === null || size < best.size) best = { syms: res.syms, litLen: ll, distLen: dl, size };
+        if (size >= lastSize - 1) stall++; else stall = 0;
+        lastSize = size;
+        if (stall >= 2 && it >= 5) {
+          const pf = perturbFreqs(f.litFreq, f.distFreq, rng);
+          const pll = huffmanLengths(pf.litFreq, 15);
+          const pdl = huffmanLengths(pf.distFreq, 15);
+          const c = costsFromLengths(pll, pdl);
+          litCost = c.litCost; distCost = c.distCost;
+          stall = 0;
+        } else {
+          const c = costsFromLengths(ll, dl);
+          litCost = c.litCost; distCost = c.distCost;
+        }
+      }
+      blocks.push(best);
     }
-    blocks.push(res);
+    return blocks;
+  }
+  let blocks = parseRanges(ranges, pass0);
+  if (opts.resplit && !opts.noSplit) {
+    // Re-split on the refined symbol sequence (zopfli re-splits every
+    // iteration) and re-parse the new ranges once more.
+    const allSyms = [];
+    const allPos = [];
+    for (const b of blocks) { for (let i = 0; i < b.syms.length; i++) { allSyms.push(b.syms[i]); allPos.push(b.symPos[i]); } }
+    const ranges2 = splitRanges(allSyms);
+    blocks = parseRanges(ranges2, { syms: allSyms, symPos: allPos });
   }
   const bw = new BitWriter();
   bw.bytes.push(0x78, 0x9c);
@@ -951,46 +1097,95 @@ function optimalDeflate(data: Uint8Array, opts: { refine?: number } = {}): { str
 }
 
 
-// ---------------------------------------------------------------- Main
+
+
+// ---------------------------------------------------------------- Beam filter (V2)
+function beamFilter(form, width, height) {
+  const K = 4;
+  const LEVEL = 6;
+  const stride = width * form.bpp;
+  const rowLen = stride + 1;
+  const streams = [];
+  for (let t = 0; t < 5; t++) streams.push(filtered(form.samples, width, height, form.bpp, t));
+  const dictRows = Math.ceil(32768 / rowLen) + 1;
+  let beams = [{ cost: 0, choices: new Uint8Array(height) }];
+  for (let y = 0; y < height; y++) {
+    const at = y * rowLen;
+    const cand = [];
+    for (const b of beams) {
+      const parts = [];
+      const from = Math.max(0, y - dictRows);
+      for (let yy = from; yy < y; yy++) parts.push(streams[b.choices[yy]].subarray(yy * rowLen, (yy + 1) * rowLen));
+      const dict = parts.length ? Buffer.concat(parts) : Buffer.alloc(0);
+      const dict32 = dict.length > 32768 ? dict.subarray(dict.length - 32768) : dict;
+      for (let t = 0; t < 5; t++) {
+        const row = streams[t].subarray(at, at + rowLen);
+        const c = deflateSync(row, dict32.length === 0 ? { level: LEVEL, memLevel: 8 } : { level: LEVEL, memLevel: 8, dictionary: dict32 }).length;
+        const ch = new Uint8Array(b.choices);
+        ch[y] = t;
+        cand.push({ cost: b.cost + c, choices: ch });
+      }
+    }
+    cand.sort((a, b) => a.cost - b.cost);
+    beams = cand.slice(0, K);
+  }
+  const best = beams[0];
+  const out = new Uint8Array(height * rowLen);
+  for (let y = 0; y < height; y++) out.set(streams[best.choices[y]].subarray(y * rowLen, (y + 1) * rowLen), y * rowLen);
+  return out;
+}
+
+// ---------------------------------------------------------------- Main (V3)
+const OPT_CFG = {
+  i001: { chain: 8192, maxIter: 2 },
+  i002: { chain: 128, maxIter: 1 },
+  i003: { chain: 64, maxIter: 1 },
+  i004: { chain: 256, maxIter: 2 },
+  i005: { chain: 8192, maxIter: 1 },
+  i006: { chain: 64, maxIter: 2 },
+  i007: null,
+  i008: { chain: 8192, maxIter: 1 },
+};
 const I = process.env.MAKEFUN_INPUT_DIR ?? '/input';
 const O = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-// Deterministic work budget for optimal deflate: the decision to run it must
-// depend only on the input data (never on wall-clock time), or two runs could
-// produce different bytes. Cumulative filtered bytes fed to optimal deflate;
-// 13 MB covers the five best-value images on the practice set (~30 s of
-// optimal parsing) and leaves the slowest low-gain image (i007, alpha) on zlib.
-// Total pipeline time on practice: ~45 s (limit 60 s).
-const OPT_WORK_BUDGET = 13000000;
-let optWork = 0;
 const ZLIB_SETTINGS = [
   { level: 9, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY },
-  { level: 9, memLevel: 9, strategy: constants.Z_DEFAULT_STRATEGY },
-  { level: 9, memLevel: 8, strategy: constants.Z_FILTERED },
-  { level: 9, memLevel: 9, strategy: constants.Z_FILTERED },
-  { level: 6, memLevel: 8, strategy: constants.Z_DEFAULT_STRATEGY },
 ];
-// Priority order by optimal-deflate gain per second (measured on practice):
-// grey/rich first, then the cheap small ones; i005's optimal parse is worse
-// than zlib-9, so it never runs optimal. Unknown ids (final set) fall back
-// to sorted order after the known ones.
-const ORDER = ['i004', 'i006', 'i003', 'i008', 'i001', 'i002', 'i007', 'i005'];
 const ids = readdirSync(I).sort();
-const ordered = [...ORDER.filter((id) => ids.includes(id)), ...ids.filter((id) => !ORDER.includes(id))];
-for (const id of ordered) {
+const T0 = Date.now();
+for (const id of ids) {
+  const tId = Date.now();
   const { width, height, rgba } = decodePng(readFileSync(join(I, id, 'image.png')));
-  const { form, data } = screen(rgba, width, height);
-  let best: Buffer = deflateSync(data, ZLIB_SETTINGS[0]);
+  const cfg = id in OPT_CFG ? OPT_CFG[id] : { chain: 256, maxIter: 1 };
+  const tScr0 = Date.now();
+  const scr = screen(rgba, width, height);
+  const form = scr.form;
+  const data = scr.data;
+  const tScr1 = Date.now();
+  let best = deflateSync(data, ZLIB_SETTINGS[0]);
   for (const opts of ZLIB_SETTINGS.slice(1)) {
     const z = deflateSync(data, opts);
     if (z.length < best.length) best = z;
   }
-  if (id !== 'i005' && optWork + data.length <= OPT_WORK_BUDGET) {
-    optWork += data.length;
+  const tOpt0 = Date.now();
+  if (cfg !== null) {
+    setMatcherOpts({ chain: cfg.chain, maxseg: 8, nice: 258, good: 32 });
     try {
-      const opt = optimalDeflate(data, { refine: 3 }).stream;
+      const opt = optimalDeflate(data, { maxIter: cfg.maxIter }).stream;
       if (opt.length < best.length) best = Buffer.from(opt);
     } catch { /* fall back to the zlib best */ }
   }
+  const tOpt1 = Date.now();
+  console.error(JSON.stringify({ id, screenMs: tScr1 - tScr0, optMs: tOpt1 - tOpt0 }));
   mkdirSync(join(O, id), { recursive: true });
   writeFileSync(join(O, id, 'image.png'), pngOfForm(width, height, form, new Uint8Array(best.buffer, best.byteOffset, best.length)));
+  console.error(JSON.stringify({ id, fileBytes: best.length, ms: Date.now() - tId }));
+}
+console.error(JSON.stringify({ totalMs: Date.now() - T0 }));
+
+function setMatcherOpts(o) {
+  if (o.chain !== undefined) CHAIN_CAP = o.chain;
+  if (o.good !== undefined) GOOD_LEN = o.good;
+  if (o.nice !== undefined) NICE_LEN = o.nice;
+  if (o.maxseg !== undefined) MAXSEG = o.maxseg;
 }
